@@ -1,87 +1,147 @@
-from flask import Flask, request, jsonify, send_file  # Import Flask functions for server, JSON, and file sending
-import bcrypt  # Import bcrypt for password hashing
-import ssl  # Import ssl for secure (TLS/SSL) connections
-import os  # Import os for file and directory operations
+from flask import Flask, request, jsonify, send_file
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.backends import default_backend
+import bcrypt
+import ssl
+import os
 
-app = Flask(__name__)  # Create a Flask application instance
+app = Flask(__name__)
 
-# This will act as an in-memory database for user data (for demo purposes only)
+# In-memory database for user data
 users_db = {}
 
 # Directory to save uploaded files
 UPLOAD_FOLDER = 'uploads'
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)  # Create the 'uploads' folder if it doesn't exist
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
+# Generate a key from a password
+def generate_key(password: str, salt: bytes):
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt,
+        iterations=100000,
+        backend=default_backend()
+    )
+    return kdf.derive(password.encode())
 
-# Function to hash a password before storing it
+# Encrypt the file
+def encrypt_file(file_path, password):
+    salt = os.urandom(16)  # Generate random salt
+    key = generate_key(password, salt)  # Derive key using password and salt
+    iv = os.urandom(16)  # Generate random IV
+    cipher = Cipher(algorithms.AES(key), modes.CFB(iv), backend=default_backend())
+    encryptor = cipher.encryptor()
+
+    # Read file data and encrypt
+    with open(file_path, 'rb') as f:
+        plaintext = f.read()
+    ciphertext = encryptor.update(plaintext) + encryptor.finalize()
+
+    # Save encrypted file with salt and IV prepended
+    encrypted_path = f"{file_path}.enc"
+    with open(encrypted_path, 'wb') as f:
+        f.write(salt + iv + ciphertext)
+
+    return encrypted_path
+
+# Decrypt the file
+def decrypt_file(encrypted_path, password):
+    with open(encrypted_path, 'rb') as f:
+        file_data = f.read()
+
+    # Extract salt, IV, and ciphertext
+    salt = file_data[:16]
+    iv = file_data[16:32]
+    ciphertext = file_data[32:]
+
+    # Derive key and decrypt
+    key = generate_key(password, salt)
+    cipher = Cipher(algorithms.AES(key), modes.CFB(iv), backend=default_backend())
+    decryptor = cipher.decryptor()
+    plaintext = decryptor.update(ciphertext) + decryptor.finalize()
+
+    # Save decrypted file
+    decrypted_path = encrypted_path.replace('.enc', '.decrypted')
+    with open(decrypted_path, 'wb') as f:
+        f.write(plaintext)
+
+    return decrypted_path
+
+# Hash password
 def hash_password(password):
-    salt = bcrypt.gensalt()  # Generate random data to make the hash stronger
-    return bcrypt.hashpw(password.encode('utf-8'), salt)  # Hash the password and return it
+    salt = bcrypt.gensalt()
+    return bcrypt.hashpw(password.encode('utf-8'), salt)
 
-
-# Function to check if a provided password matches a stored hashed password
+# Check hashed password
 def check_password(hashed_password, user_password):
-    return bcrypt.checkpw(user_password.encode('utf-8'), hashed_password)  # Compare hashed and plain passwords
+    return bcrypt.checkpw(user_password.encode('utf-8'), hashed_password)
 
-
-# Route for registering a new user
+# Register route
 @app.route('/register', methods=['POST'])
 def register():
-    data = request.get_json()  # Get the JSON data from the request
-    username = data['username']  # Extract the username
-    password = data['password']  # Extract the password
+    data = request.get_json()
+    username = data['username']
+    password = data['password']
 
-    if username in users_db:  # Check if the user already exists
-        return jsonify({'message': 'User already exists'}), 400  # Return error if user exists
+    if username in users_db:
+        return jsonify({'message': 'User already exists'}), 400
 
-    hashed_password = hash_password(password)  # Hash the password for secure storage
-    users_db[username] = hashed_password  # Save the username and hashed password in our database
-    return jsonify({'message': 'User registered successfully'}), 200  # Confirm registration success
+    hashed_password = hash_password(password)
+    users_db[username] = hashed_password
+    return jsonify({'message': 'User registered successfully'}), 200
 
-
-# Route for user login
+# Login route
 @app.route('/login', methods=['POST'])
 def login():
-    data = request.get_json()  # Get the JSON data from the request
-    username = data['username']  # Extract the username
-    password = data['password']  # Extract the password
+    data = request.get_json()
+    username = data['username']
+    password = data['password']
 
-    if username not in users_db:  # Check if the user exists
-        return jsonify({'message': 'User not found'}), 404  # Return error if user doesn't exist
+    if username not in users_db:
+        return jsonify({'message': 'User not found'}), 404
 
-    stored_password = users_db[username]  # Retrieve the stored hashed password
-
-    if check_password(stored_password, password):  # Check if provided password matches stored hash
-        return jsonify({'message': 'Login successful!'}), 200  # Confirm login success
+    stored_password = users_db[username]
+    if check_password(stored_password, password):
+        return jsonify({'message': 'Login successful!'}), 200
     else:
-        return jsonify({'message': 'Incorrect password'}), 401  # Return error if password is incorrect
+        return jsonify({'message': 'Incorrect password'}), 401
 
-
-# Route for file upload
+# Upload route
 @app.route('/upload', methods=['POST'])
 def upload_file():
-    if 'file' not in request.files:  # Check if the file part is in the request
+    if 'file' not in request.files:
         return jsonify({'message': 'No file part in the request'}), 400
-    file = request.files['file']  # Get the file from the request
-    if file.filename == '':  # Check if a file was selected
+    file = request.files['file']
+    if file.filename == '':
         return jsonify({'message': 'No selected file'}), 400
-    file_path = os.path.join(UPLOAD_FOLDER, file.filename)  # Define where to save the file
-    file.save(file_path)  # Save the file to the specified path
-    return jsonify({'message': f'File {file.filename} uploaded successfully'}), 200  # Confirm file upload success
 
-# adding change to commit
+    file_path = os.path.join(UPLOAD_FOLDER, file.filename)
+    file.save(file_path)
 
-# Route for file download
+    # Encrypt the file
+    password = "securepassword123"
+    encrypted_path = encrypt_file(file_path, password)
+    os.remove(file_path)
+
+    return jsonify({'message': f'File {file.filename} encrypted and uploaded successfully'}), 200
+
+# Download route
 @app.route('/download/<filename>', methods=['GET'])
 def download_file(filename):
-    file_path = os.path.join(UPLOAD_FOLDER, filename)  # Define the path to the file
-    if not os.path.exists(file_path):  # Check if the file exists
-        return jsonify({'message': 'File not found'}), 404  # Return error if file doesn't exist
-    return send_file(file_path, as_attachment=True)  # Send the file as an attachment to download
+    encrypted_path = os.path.join(UPLOAD_FOLDER, f"{filename}.enc")
+    if not os.path.exists(encrypted_path):
+        return jsonify({'message': 'File not found'}), 404
 
+    # Decrypt the file
+    password = "securepassword123"
+    decrypted_path = decrypt_file(encrypted_path, password)
+
+    return send_file(decrypted_path, as_attachment=True)
 
 if __name__ == '__main__':
-    # Set up SSL/TLS encryption for secure communication
-    context = ssl.SSLContext(ssl.PROTOCOL_TLS)  # Specify TLS protocol for secure connection
-    context.load_cert_chain(certfile='cert.pem', keyfile='key.pem')  # Load the SSL certificate and private key
-    app.run(host='0.0.0.0', port=5000, ssl_context=context)  # Start the app on https://localhost:5000
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS)
+    context.load_cert_chain(certfile='cert.pem', keyfile='key.pem')
+    app.run(host='0.0.0.0', port=5000, ssl_context=context)
